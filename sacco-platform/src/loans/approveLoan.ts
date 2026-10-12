@@ -4,8 +4,8 @@ import { notifyMember } from '../channels/notifyMember';
 // Approves a loan and fires a confirmation through the shared notifier.
 export async function approveLoan(loanId: number) {
   const { rows } = await pool.query(
-    `UPDATE loans SET status = 'approved' WHERE id = $1
-     RETURNING member_id, amount_due`,
+    `UPDATE loans SET status = 'approved', approved_at = NOW() WHERE id = $1
+     RETURNING member_id, amount_due, COALESCE(requested_amount, amount_due) AS requested`,
     [loanId]
   );
   const loan = rows[0];
