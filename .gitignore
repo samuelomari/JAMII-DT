@@ -1,0 +1,29 @@
+# Dependencies
+node_modules/
+sacco-platform/node_modules/
+
+# Env / secrets — never commit real credentials
+.env
+sacco-platform/.env
+*.local
+
+# Build output
+dist/
+sacco-platform/dist/
+build/
+
+# Local dev database
+.pgdata/
+sacco-platform/.pgdata/
+
+# Logs & OS
+*.log
+/tmp/
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/*
+!.vscode/extensions.json
+.idea/
+*.swp

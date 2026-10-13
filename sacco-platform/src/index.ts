@@ -10,6 +10,11 @@ import { approveLoan } from './loans/approveLoan';
 import { applyForLoan } from './loans/applyLoan';
 import { repayLoan } from './loans/repayLoan';
 import { rejectLoan, disburseLoan, getLoanStatement } from './loans/loanLifecycle';
+import { getLoanSchedule, previewLoanSchedule, assessPenalties, waivePenalty, listPenalties, writeOffLoan } from './loans/lifecycleExtras';
+import { declareDividendCycle, listDividendCycles, getDividendCycle, payDividendCycle, memberDividends } from './dividends/dividends';
+import { stkPush, handleStkCallback, listMpesaCallbacks } from './payments/mpesa';
+import { authenticate, createUser, listUsers, setUserRole, countUsers } from './auth/users';
+import { requireAuth, requireRole, authMode } from './auth/middleware';
 import { listMembers, getMember, createMember, updateMember } from './members/members';
 import { savingsTransaction, memberLedger } from './savings/savings';
 import { portfolioSummary, arrearsReport, upcomingDues } from './reports/reports';
@@ -18,11 +23,80 @@ import { validateBody, validateIdParam } from './middleware/validate';
 const app = express();
 app.use(express.json());
 
-app.get('/health', (_req, res) => res.json({ ok: true }));
+app.get('/health', (_req, res) => res.json({ ok: true, auth: authMode() }));
+
+// ---- Auth (public: login + first-user bootstrap) ----
+app.post('/auth/login', validateBody({ phone: 'string', password: 'string' }), async (req, res) => {
+  try {
+    res.json(await authenticate(req.body.phone, req.body.password));
+  } catch (err: any) { res.status(401).json({ error: err.message ?? 'Login failed' }); }
+});
+
+app.post('/auth/register', async (req, res) => {
+  try {
+    const users = await countUsers();
+    // Bootstrap: first user becomes admin with no token; afterwards admin-only.
+    if (users > 0) {
+      const header = req.headers.authorization ?? '';
+      if (!header.startsWith('Bearer ')) return res.status(401).json({ error: 'Authentication required' });
+      const { verifyToken } = await import('./auth/jwt');
+      const claims = verifyToken(header.slice(7));
+      if (claims.role !== 'admin') return res.status(403).json({ error: 'Only admins can create users' });
+    }
+    const user = await createUser({
+      name: req.body?.name, phone: req.body?.phone, password: req.body?.password,
+      role: users === 0 ? 'admin' : req.body?.role, memberId: req.body?.memberId ?? null,
+    });
+    res.status(201).json(user);
+  } catch (err: any) { res.status(400).json({ error: err.message ?? 'Registration failed' }); }
+});
+
+app.get('/auth/me', requireAuth, async (req, res) => { res.json({ auth: req.auth, mode: authMode() }); });
+
+app.get('/users', requireAuth, requireRole('admin'), async (_req, res) => {
+  try { res.json(await listUsers()); } catch (err) { res.status(500).json({ error: 'Failed to list users' }); }
+});
+
+app.patch('/users/:id/role', requireAuth, requireRole('admin'), validateIdParam,
+  validateBody({ role: 'string' }), async (req, res) => {
+    try { res.json(await setUserRole(Number(req.params.id), req.body.role)); }
+    catch (err: any) { res.status(400).json({ error: err.message }); }
+  });
+
+// ---- Loan schedule / penalties / write-off ----
+app.get('/loans/:id/schedule', requireAuth, validateIdParam, async (req, res) => {
+  try { res.json(await getLoanSchedule(Number(req.params.id), req.query.asOf as string | undefined)); }
+  catch (err: any) { res.status(404).json({ error: err.message }); }
+});
+
+app.post('/loans/schedule/preview', requireAuth, validateBody({ principal: 'number' }, { allowExtra: true }), async (req, res) => {
+  try { res.json(await previewLoanSchedule(req.body)); }
+  catch (err: any) { res.status(400).json({ error: err.message }); }
+});
+
+app.post('/loans/:id/penalties/assess', requireAuth, requireRole('admin', 'teller'), validateIdParam, async (req, res) => {
+  try { res.json(await assessPenalties(Number(req.params.id), req.body?.asOf)); }
+  catch (err: any) { res.status(400).json({ error: err.message }); }
+});
+
+app.get('/loans/:id/penalties', requireAuth, validateIdParam, async (req, res) => {
+  try { res.json(await listPenalties(Number(req.params.id))); }
+  catch (err) { res.status(500).json({ error: 'Failed to list penalties' }); }
+});
+
+app.post('/penalties/:id/waive', requireAuth, requireRole('admin', 'teller'), validateIdParam, async (req, res) => {
+  try { res.json(await waivePenalty(Number(req.params.id), req.body?.reason)); }
+  catch (err: any) { res.status(400).json({ error: err.message }); }
+});
+
+app.post('/loans/:id/write-off', requireAuth, requireRole('admin'), validateIdParam, async (req, res) => {
+  try { res.json(await writeOffLoan(Number(req.params.id), req.body?.reason)); }
+  catch (err: any) { res.status(400).json({ error: err.message }); }
+});
 
 // Full loan check: eligibility + guarantor cover + suggestions if short.
 // Body: { memberId, amount, guarantors: [{ memberId, amount }] }
-app.post('/loans/evaluate', async (req, res) => {
+app.post('/loans/evaluate', requireAuth, async (req, res) => {
   try {
     const { memberId, amount, guarantors = [] } = req.body;
     const financials = await loadMemberFinancials(memberId, (s, p) => pool.query(s, p));
@@ -61,7 +135,7 @@ app.post('/loans/evaluate', async (req, res) => {
   }
 });
 
-app.post('/loans/:id/approve', validateIdParam, async (req, res) => {
+app.post('/loans/:id/approve', requireAuth, requireRole('admin', 'teller'), validateIdParam, async (req, res) => {
   try {
     res.json(await approveLoan(Number(req.params.id)));
   } catch (err: any) {
@@ -70,7 +144,7 @@ app.post('/loans/:id/approve', validateIdParam, async (req, res) => {
   }
 });
 
-app.post('/loans/apply', validateBody({ memberId: 'number', amount: 'number' }, { allowExtra: true }), async (req, res) => {
+app.post('/loans/apply', requireAuth, validateBody({ memberId: 'number', amount: 'number' }, { allowExtra: true }), async (req, res) => {
   try {
     const result = await applyForLoan(req.body);
     res.status(result.approved ? 201 : 422).json(result);
@@ -80,7 +154,7 @@ app.post('/loans/apply', validateBody({ memberId: 'number', amount: 'number' }, 
   }
 });
 
-app.post('/loans/:id/repay', validateIdParam, validateBody({ amount: 'number' }, { allowExtra: true }), async (req, res) => {
+app.post('/loans/:id/repay', requireAuth, requireRole('admin', 'teller'), validateIdParam, validateBody({ amount: 'number' }, { allowExtra: true }), async (req, res) => {
   try {
     res.json(await repayLoan({ loanId: Number(req.params.id), ...req.body }));
   } catch (err: any) {
@@ -89,7 +163,7 @@ app.post('/loans/:id/repay', validateIdParam, validateBody({ amount: 'number' },
   }
 });
 
-app.post('/loans/:id/reject', validateIdParam, async (req, res) => {
+app.post('/loans/:id/reject', requireAuth, requireRole('admin', 'teller'), validateIdParam, async (req, res) => {
   try {
     res.json(await rejectLoan(Number(req.params.id), req.body?.reason));
   } catch (err: any) {
@@ -98,7 +172,7 @@ app.post('/loans/:id/reject', validateIdParam, async (req, res) => {
   }
 });
 
-app.post('/loans/:id/disburse', validateIdParam, async (req, res) => {
+app.post('/loans/:id/disburse', requireAuth, requireRole('admin', 'teller'), validateIdParam, async (req, res) => {
   try {
     res.json(await disburseLoan(Number(req.params.id)));
   } catch (err: any) {
@@ -107,7 +181,7 @@ app.post('/loans/:id/disburse', validateIdParam, async (req, res) => {
   }
 });
 
-app.get('/loans/:id/statement', validateIdParam, async (req, res) => {
+app.get('/loans/:id/statement', requireAuth, validateIdParam, async (req, res) => {
   try {
     res.json(await getLoanStatement(Number(req.params.id)));
   } catch (err: any) {
@@ -116,7 +190,7 @@ app.get('/loans/:id/statement', validateIdParam, async (req, res) => {
   }
 });
 
-app.get('/loans', async (req, res) => {
+app.get('/loans', requireAuth, async (req, res) => {
   try {
     const { status, memberId, limit = '50' } = req.query as Record<string, string>;
     const conds: string[] = [];
@@ -136,7 +210,7 @@ app.get('/loans', async (req, res) => {
   }
 });
 
-app.get('/members', async (req, res) => {
+app.get('/members', requireAuth, async (req, res) => {
   try {
     res.json(await listMembers(Number(req.query.limit ?? 50), Number(req.query.offset ?? 0), req.query.search as string | undefined));
   } catch (err) {
@@ -145,7 +219,7 @@ app.get('/members', async (req, res) => {
   }
 });
 
-app.get('/members/:id', validateIdParam, async (req, res) => {
+app.get('/members/:id', requireAuth, requireRole('admin', 'teller', 'member'), validateIdParam, async (req, res) => {
   try {
     res.json(await getMember(Number(req.params.id)));
   } catch (err: any) {
@@ -153,7 +227,7 @@ app.get('/members/:id', validateIdParam, async (req, res) => {
   }
 });
 
-app.post('/members', validateBody({ name: 'string', phone: 'string' }, { allowExtra: true }), async (req, res) => {
+app.post('/members', requireAuth, requireRole('admin', 'teller'), validateBody({ name: 'string', phone: 'string' }, { allowExtra: true }), async (req, res) => {
   try {
     res.status(201).json(await createMember(req.body));
   } catch (err: any) {
@@ -162,7 +236,7 @@ app.post('/members', validateBody({ name: 'string', phone: 'string' }, { allowEx
   }
 });
 
-app.patch('/members/:id', validateIdParam, async (req, res) => {
+app.patch('/members/:id', requireAuth, requireRole('admin', 'teller'), validateIdParam, async (req, res) => {
   try {
     res.json(await updateMember(Number(req.params.id), req.body ?? {}));
   } catch (err: any) {
@@ -170,7 +244,7 @@ app.patch('/members/:id', validateIdParam, async (req, res) => {
   }
 });
 
-app.post('/members/:id/savings', validateIdParam, validateBody({ type: 'string', amount: 'number' }, { allowExtra: true }), async (req, res) => {
+app.post('/members/:id/savings', requireAuth, requireRole('admin', 'teller'), validateIdParam, validateBody({ type: 'string', amount: 'number' }, { allowExtra: true }), async (req, res) => {
   try {
     const { type, amount, reference } = req.body;
     if (!['deposit', 'withdrawal', 'share_purchase'].includes(type)) {
@@ -182,7 +256,7 @@ app.post('/members/:id/savings', validateIdParam, validateBody({ type: 'string',
   }
 });
 
-app.get('/members/:id/ledger', validateIdParam, async (req, res) => {
+app.get('/members/:id/ledger', requireAuth, requireRole('admin', 'teller', 'member'), validateIdParam, async (req, res) => {
   try {
     res.json(await memberLedger(Number(req.params.id), Number(req.query.limit ?? 50)));
   } catch (err) {
@@ -191,12 +265,12 @@ app.get('/members/:id/ledger', validateIdParam, async (req, res) => {
 });
 
 // Manually trigger the reminder job (handy for demos).
-app.post('/jobs/loan-reminders/run', async (_req, res) => {
+app.post('/jobs/loan-reminders/run', requireAuth, requireRole('admin', 'teller'), async (_req, res) => {
   await checkLoanDueDates();
   res.json({ ok: true });
 });
 
-app.get('/guarantors/suggest', async (req, res) => {
+app.get('/guarantors/suggest', requireAuth, async (req, res) => {
   try {
     const shortfall = Number(req.query.shortfall ?? 0);
     const exclude = String(req.query.exclude ?? '').split(',').filter(Boolean).map(Number);
@@ -209,7 +283,7 @@ app.get('/guarantors/suggest', async (req, res) => {
   }
 });
 
-app.get('/reports/summary', async (_req, res) => {
+app.get('/reports/summary', requireAuth, requireRole('admin', 'teller'), async (_req, res) => {
   try {
     res.json(await portfolioSummary());
   } catch (err) {
@@ -218,7 +292,7 @@ app.get('/reports/summary', async (_req, res) => {
   }
 });
 
-app.get('/reports/arrears', async (_req, res) => {
+app.get('/reports/arrears', requireAuth, requireRole('admin', 'teller'), async (_req, res) => {
   try {
     res.json(await arrearsReport());
   } catch (err) {
@@ -227,7 +301,7 @@ app.get('/reports/arrears', async (_req, res) => {
   }
 });
 
-app.get('/reports/upcoming', async (req, res) => {
+app.get('/reports/upcoming', requireAuth, async (req, res) => {
   try {
     res.json(await upcomingDues(Number(req.query.days ?? 7)));
   } catch (err) {
@@ -236,7 +310,7 @@ app.get('/reports/upcoming', async (req, res) => {
   }
 });
 
-app.get('/policy', async (_req, res) => {
+app.get('/policy', requireAuth, async (_req, res) => {
   try {
     res.json(await loadPolicy());
   } catch (err) {
@@ -244,7 +318,7 @@ app.get('/policy', async (_req, res) => {
   }
 });
 
-app.put('/policy', async (req, res) => {
+app.put('/policy', requireAuth, requireRole('admin'), async (req, res) => {
   try {
     const b = req.body ?? {};
     const { rows } = await pool.query(
@@ -260,11 +334,54 @@ app.put('/policy', async (req, res) => {
   }
 });
 
-app.get('/notifications', async (_req, res) => {
+app.get('/notifications', requireAuth, requireRole('admin', 'teller'), async (_req, res) => {
   const { rows } = await pool.query(
     `SELECT * FROM notification_log ORDER BY sent_at DESC LIMIT 100`
   );
   res.json(rows);
+});
+
+// ---- Dividends ----
+app.post('/dividends/declare', requireAuth, requireRole('admin'),
+  validateBody({ label: 'string', fiscalYear: 'number', shareRate: 'number', savingsRate: 'number' }), async (req, res) => {
+    try { res.status(201).json(await declareDividendCycle(req.body)); }
+    catch (err: any) { res.status(400).json({ error: err.message }); }
+  });
+
+app.get('/dividends', requireAuth, async (_req, res) => {
+  try { res.json(await listDividendCycles()); } catch (err) { res.status(500).json({ error: 'Failed to list cycles' }); }
+});
+
+app.get('/dividends/:id', requireAuth, validateIdParam, async (req, res) => {
+  try { res.json(await getDividendCycle(Number(req.params.id))); }
+  catch (err: any) { res.status(404).json({ error: err.message }); }
+});
+
+app.post('/dividends/:id/pay', requireAuth, requireRole('admin'), validateIdParam, async (req, res) => {
+  try { res.json(await payDividendCycle(Number(req.params.id))); }
+  catch (err: any) { res.status(400).json({ error: err.message }); }
+});
+
+app.get('/members/:id/dividends', requireAuth, validateIdParam, async (req, res) => {
+  try { res.json(await memberDividends(Number(req.params.id))); }
+  catch (err) { res.status(500).json({ error: 'Failed to load dividends' }); }
+});
+
+// ---- M-Pesa (callback stays public — Daraja cannot send Bearer tokens) ----
+app.post('/payments/mpesa/stkpush', requireAuth, requireRole('admin', 'teller'),
+  validateBody({ memberId: 'number', amount: 'number' }, { allowExtra: true }), async (req, res) => {
+    try { res.json(await stkPush(req.body)); }
+    catch (err: any) { res.status(400).json({ error: err.message }); }
+  });
+
+app.post('/payments/mpesa/callback', async (req, res) => {
+  try { res.json(await handleStkCallback(req.body)); }
+  catch (err) { console.error(err); res.json({ ResultCode: 1, ResultDesc: 'Failed' }); }
+});
+
+app.get('/payments/mpesa/callbacks', requireAuth, requireRole('admin', 'teller'), async (req, res) => {
+  try { res.json(await listMpesaCallbacks(Number(req.query.limit ?? 100))); }
+  catch (err) { res.status(500).json({ error: 'Failed to list callbacks' }); }
 });
 
 const port = Number(process.env.PORT ?? 3000);

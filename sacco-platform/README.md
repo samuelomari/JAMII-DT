@@ -65,6 +65,47 @@ View sent messages:
 
     curl localhost:3000/notifications
 
+## New: amortization, penalties, dividends, M-Pesa, auth
+
+Loan schedule (per-installment principal/interest split + live allocation):
+
+    curl localhost:3000/loans/1/schedule
+    curl -X POST localhost:3000/loans/schedule/preview -H 'Content-Type: application/json' \
+      -d '{"principal":200000,"annualInterestRatePct":12,"termMonths":12}'
+
+Late penalties (rule in `lending_policy`: `late_penalty_rate` % per 30-day
+block past `grace_period_days`; idempotent) + write-off with guarantor recovery:
+
+    curl -X POST localhost:3000/loans/1/penalties/assess
+    curl localhost:3000/loans/1/penalties
+    curl -X POST localhost:3000/penalties/1/waive -H 'Content-Type: application/json' -d '{"reason":"Goodwill"}'
+    curl -X POST localhost:3000/loans/1/write-off -H 'Content-Type: application/json' -d '{"reason":"Unrecoverable"}'
+
+Dividends (declare a cycle, then pay it into members' savings):
+
+    curl -X POST localhost:3000/dividends/declare -H 'Content-Type: application/json' \
+      -d '{"label":"FY2025 Dividends","fiscalYear":2025,"shareRate":8,"savingsRate":5}'
+    curl localhost:3000/dividends
+    curl -X POST localhost:3000/dividends/1/pay
+    curl localhost:3000/members/2/dividends
+
+M-Pesa Daraja (configure MPESA_* in `.env`; callback auto-matches oldest
+open loan first, else savings deposit; idempotent on TransID):
+
+    curl -X POST localhost:3000/payments/mpesa/stkpush -H 'Content-Type: application/json' \
+      -d '{"memberId":2,"amount":5000}'
+    curl localhost:3000/payments/mpesa/callbacks
+
+Auth (JWT, roles admin | teller | member). Disabled by default for demos;
+enforce with `JWT_SECRET=<long-random> AUTH_DISABLED=false`:
+
+    curl -X POST localhost:3000/auth/register -H 'Content-Type: application/json' \
+      -d '{"name":"Admin","phone":"+254700000099","password":"supersecret123"}'   # first user becomes admin
+    curl -X POST localhost:3000/auth/login -H 'Content-Type: application/json' \
+      -d '{"phone":"+254700000099","password":"supersecret123"}'
+    curl localhost:3000/auth/me -H "Authorization: Bearer <token>"
+    # Afterwards pass -H "Authorization: Bearer <token>" on every call.
+
 ## Notes
 - Africa's Talking sandbox only delivers to the simulator; use a live account for real phones.
 - Twilio WhatsApp sandbox requires each test phone to join the sandbox first.
